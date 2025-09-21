@@ -16,3 +16,11 @@
 ━削除フォルダの場所━
 ・c:\trush\
 　に基本的に永久的に削除するファイルが入ります。
+
+━セットアップ━
+　このソースフォルダを展開してください。TrushBin.SlnをVisualStudioで開きます。
+　１．Releaseにてビルドする
+　２．C:\Users\toshi>g:
+　３．G:\>cd G:\PROJECT\00complete\TrushBin\TrushBin\TrushBin\bin\Release\net8.0-windows
+　４．G:\PROJECT\00complete\TrushBin\TrushBin\TrushBin\bin\Release\net8.0-windows>TrushBin.exe --setup
+　５．これにてデスクトップに「ゴミ箱(Trush)」が作成されます。
