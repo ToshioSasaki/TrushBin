@@ -1,10 +1,6 @@
-using System;
-using System.Collections.Generic;
-using System.IO;
-using System.Linq;
 using System.Runtime.InteropServices;
+using System.Security.Cryptography;
 using System.Text;
-using System.Windows.Forms;
 
 namespace TrushBin
 {
@@ -35,19 +31,19 @@ namespace TrushBin
                     return;
                 }
 
-                // 空にする
+                // 空にする（安全消去）
                 if (args.Any(a => a.Equals("--empty", StringComparison.OrdinalIgnoreCase)))
                 {
                     var totalNow = TrushLogic.CountEntries(TrushLogic.TrushPath);
                     var confirm = MessageBox.Show(
-                        $"ゴミ箱を永久的に削除します。よろしいですか？\n現在 {totalNow} 件",
+                        $"ゴミ箱を完全消去（復旧困難化）します。よろしいですか？\n現在 {totalNow} 件",
                         "TrushBin", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
 
                     if (confirm == DialogResult.OK)
                     {
                         int f, d;
-                        int total = TrushLogic.EmptyTrush(out f, out d);
-                        MessageBox.Show($"削除しました。{total} 件（ファイル {f} / フォルダ {d}）", "TrushBin");
+                        int total = TrushLogic.EmptyTrushSecure(out f, out d);
+                        MessageBox.Show($"完全消去しました。{total} 件（ファイル {f} / フォルダ {d}）", "TrushBin");
                     }
 
                     TrushLogic.UpdateAllShortcutIcons();
@@ -64,22 +60,22 @@ namespace TrushBin
                     return;
                 }
 
-                // 引数なし：1アイコン運用の簡易メニュー
+                // 引数なし：簡易メニュー
                 var count = TrushLogic.CountEntries(TrushLogic.TrushPath);
                 var result = MessageBox.Show(
-                    $"どうする？\n\n[はい]：空にする（現在 {count} 件）\n[いいえ]：フォルダを開く\n[キャンセル]：閉じる",
+                    $"どうする？\n\n[はい]：完全消去（現在 {count} 件）\n[いいえ]：フォルダを開く\n[キャンセル]：閉じる",
                     "TrushBin", MessageBoxButtons.YesNoCancel, MessageBoxIcon.Question);
 
                 if (result == DialogResult.Yes)
                 {
                     var confirm = MessageBox.Show(
-                        $"ゴミ箱を永久的に削除します。よろしいですか？\n現在 {count} 件",
+                        $"ゴミ箱を完全消去（復旧困難化）します。よろしいですか？\n現在 {count} 件",
                         "TrushBin", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
                     if (confirm == DialogResult.OK)
                     {
                         int f, d;
-                        int total = TrushLogic.EmptyTrush(out f, out d);
-                        MessageBox.Show($"削除しました。{total} 件（ファイル {f} / フォルダ {d}）", "TrushBin");
+                        int total = TrushLogic.EmptyTrushSecure(out f, out d);
+                        MessageBox.Show($"完全消去しました。{total} 件（ファイル {f} / フォルダ {d}）", "TrushBin");
                     }
                     TrushLogic.UpdateAllShortcutIcons();
                     return;
@@ -99,7 +95,8 @@ namespace TrushBin
 
     internal static class TrushLogic
     {
-        public static readonly string TrushPath = @"C:\trush"; // ご希望どおりの表記
+        // ★ 保存先パス（リネーム済み）
+        public static readonly string TrushPath = @"C:\trushbin";
 
         public static void EnsureTrushDir()
         {
@@ -123,13 +120,13 @@ namespace TrushBin
                     if (File.Exists(p))
                     {
                         var dest = UniqueDestination(Path.Combine(TrushPath, Path.GetFileName(p)));
-                        MoveFileSafe(p, dest);
+                        MoveFileSafeWithSourceWipe(p, dest);
                         if (!File.Exists(p)) moved++; else failures.Add(p);
                     }
                     else if (Directory.Exists(p))
                     {
                         var dest = UniqueDestination(Path.Combine(TrushPath, new DirectoryInfo(p).Name));
-                        MoveDirectorySafe(p, dest);
+                        MoveDirectorySafeWithSourceWipe(p, dest);
                         if (!Directory.Exists(p)) moved++; else failures.Add(p);
                     }
                 }
@@ -151,56 +148,48 @@ namespace TrushBin
             return moved;
         }
 
-        // ---------- フォルダも確実に空にする版 ----------
-        public static int EmptyTrush() => EmptyTrush(out _, out _);
-
-        public static int EmptyTrush(out int filesDeleted, out int dirsDeleted)
+        // ===== 完全消去（Secure Empty） =====
+        public static int EmptyTrushSecure(out int filesDeleted, out int dirsDeleted)
         {
             filesDeleted = 0;
             dirsDeleted = 0;
 
             if (!Directory.Exists(TrushPath)) return 0;
 
-            // 1) 全ファイル削除（属性を戻してから）
-            foreach (var f in Directory.EnumerateFiles(TrushPath, "*", SearchOption.AllDirectories))
+            // 1) まずファイルをすべて安全消去
+            foreach (var f in EnumerateFilesNoReparse(TrushPath))
             {
                 try
                 {
-                    File.SetAttributes(f, FileAttributes.Normal);
-                    File.Delete(f);
+                    SecureWipe.SecureDeleteFile(f); // 上書き・リネーム・縮小・削除
                     filesDeleted++;
                 }
                 catch { /* 続行 */ }
             }
 
-            // 2) 全ディレクトリを“深い順”に削除（入れ子を確実に除去）
-            var allDirsDeepFirst = Directory
-                .EnumerateDirectories(TrushPath, "*", SearchOption.AllDirectories)
-                .OrderByDescending(d => d.Length);
+            // 2) ディレクトリは深い順でリネーム→削除
+            var allDirsDeepFirst = EnumerateDirectoriesNoReparse(TrushPath)
+                .OrderByDescending(d => d.Length)
+                .ToList();
 
             foreach (var d in allDirsDeepFirst)
             {
                 try
                 {
-                    var di = new DirectoryInfo(d);
-                    di.Attributes = FileAttributes.Normal;
-                    Directory.Delete(d, recursive: false); // 中身は既に空のはず
-                    dirsDeleted++;
+                    var rndName = SecureWipe.RandomName();
+                    var parent = Path.GetDirectoryName(d)!;
+                    var renamed = Path.Combine(parent, rndName);
+
+                    try { Directory.Move(d, renamed); } catch { renamed = d; }
+                    try { Directory.Delete(renamed, recursive: false); dirsDeleted++; } catch { /* 続行 */ }
                 }
                 catch { /* 続行 */ }
             }
 
-            // 3) 念のため直下に残った空ディレクトリがあれば最後に一掃
+            // 3) 直下の空ディレクトリが残っていれば最後に一掃
             foreach (var d in Directory.EnumerateDirectories(TrushPath, "*", SearchOption.TopDirectoryOnly))
             {
-                try
-                {
-                    var di = new DirectoryInfo(d);
-                    di.Attributes = FileAttributes.Normal;
-                    Directory.Delete(d, recursive: false);
-                    dirsDeleted++;
-                }
-                catch { /* 続行 */ }
+                try { Directory.Delete(d, false); dirsDeleted++; } catch { /* 続行 */ }
             }
 
             return filesDeleted + dirsDeleted;
@@ -209,8 +198,8 @@ namespace TrushBin
         public static int CountEntries(string dir)
         {
             if (!Directory.Exists(dir)) return 0;
-            int files = Directory.GetFiles(dir, "*", SearchOption.AllDirectories).Length;
-            int dirs = Directory.GetDirectories(dir, "*", SearchOption.AllDirectories).Length;
+            int files = EnumerateFilesNoReparse(dir).Count();
+            int dirs = EnumerateDirectoriesNoReparse(dir).Count();
             return files + dirs;
         }
 
@@ -232,7 +221,7 @@ namespace TrushBin
             catch { /* 致命ではないので無視 */ }
         }
 
-        // ---------- 内部ユーティリティ ----------
+        // ===== 内部ユーティリティ =====
 
         private static bool IsCrossVolume(string src, string dst)
         {
@@ -241,7 +230,8 @@ namespace TrushBin
             return !string.Equals(r1, r2, StringComparison.OrdinalIgnoreCase);
         }
 
-        private static void MoveFileSafe(string src, string dst)
+        // 別ボリューム時は「コピー→元をシュレッド削除」
+        private static void MoveFileSafeWithSourceWipe(string src, string dst)
         {
             Directory.CreateDirectory(Path.GetDirectoryName(dst)!);
             try
@@ -253,16 +243,15 @@ namespace TrushBin
                 else
                 {
                     File.Copy(src, dst, overwrite: false);
-                    File.SetAttributes(src, FileAttributes.Normal);
-                    File.Delete(src);   // 別ボリューム：コピー→元削除
+                    // 元ファイルを安全消去
+                    SecureWipe.SecureDeleteFile(src);
                 }
             }
             catch (IOException)
             {
-                // 念のためフォールバック
+                // フォールバック
                 File.Copy(src, dst, overwrite: false);
-                File.SetAttributes(src, FileAttributes.Normal);
-                File.Delete(src);
+                SecureWipe.SecureDeleteFile(src);
             }
         }
 
@@ -280,7 +269,7 @@ namespace TrushBin
             }
         }
 
-        private static void MoveDirectorySafe(string src, string dst)
+        private static void MoveDirectorySafeWithSourceWipe(string src, string dst)
         {
             try
             {
@@ -290,14 +279,15 @@ namespace TrushBin
                 }
                 else
                 {
+                    // 別ボリューム：コピー後、元ディレクトリを安全消去
                     CopyDirectoryRecursive(src, dst);
-                    Directory.Delete(src, recursive: true);
+                    SecureWipe.SecureDeleteDirectoryTree(src);
                 }
             }
             catch (IOException)
             {
                 CopyDirectoryRecursive(src, dst);
-                Directory.Delete(src, recursive: true);
+                SecureWipe.SecureDeleteDirectoryTree(src);
             }
         }
 
@@ -318,6 +308,292 @@ namespace TrushBin
             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmssfff");
             return Path.Combine(dir, $"{baseName}_{stamp}{ext}");
         }
+
+        // 再解析ポイント（ジャンクション/シンボリックリンク等）はファイル/ディレクトリ列挙から除外
+        private static IEnumerable<string> EnumerateFilesNoReparse(string root)
+        {
+            foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
+            {
+                bool isReparsePoint = false;
+                try
+                {
+                    var attr = File.GetAttributes(f);
+                    isReparsePoint = (attr & FileAttributes.ReparsePoint) != 0;
+                }
+                catch
+                {
+                    // Skip this file if an exception occurs
+                    continue;
+                }
+
+                if (!isReparsePoint)
+                {
+                    yield return f;
+                }
+            }
+        }
+
+        private static IEnumerable<string> EnumerateDirectoriesNoReparse(string root)
+        {
+            foreach (var d in Directory.EnumerateDirectories(root, "*", SearchOption.AllDirectories))
+            {
+                bool isReparsePoint = false;
+                try
+                {
+                    var attr = File.GetAttributes(d);
+                    isReparsePoint = (attr & FileAttributes.ReparsePoint) != 0;
+                }
+                catch
+                {
+                    // Skip this directory if an exception occurs
+                    continue;
+                }
+
+                if (!isReparsePoint)
+                {
+                    yield return d;
+                }
+            }
+        }
+    }
+
+    internal static class SecureWipe
+    {
+        private const int BufferSize = 1024 * 1024; // 1MB
+        private static readonly RNGCryptoServiceProvider Rng = new RNGCryptoServiceProvider();
+
+        public static void SecureDeleteDirectoryTree(string dir)
+        {
+            if (!Directory.Exists(dir)) return;
+
+            // まずファイルを全て安全消去
+            foreach (var f in Directory.EnumerateFiles(dir, "*", SearchOption.AllDirectories))
+            {
+                try { SecureDeleteFile(f); } catch { /* 続行 */ }
+            }
+
+            // ディレクトリ（深い順）をランダム名に改名してから削除
+            var allDirs = Directory.EnumerateDirectories(dir, "*", SearchOption.AllDirectories)
+                .OrderByDescending(p => p.Length)
+                .ToList();
+
+            foreach (var d in allDirs)
+            {
+                try
+                {
+                    var rndName = RandomName();
+                    var parent = Path.GetDirectoryName(d)!;
+                    var renamed = Path.Combine(parent, rndName);
+                    try { Directory.Move(d, renamed); } catch { renamed = d; }
+                    try { Directory.Delete(renamed, false); } catch { /* 続行 */ }
+                }
+                catch { /* 続行 */ }
+            }
+
+            try { Directory.Delete(dir, false); } catch { /* 続行 */ }
+        }
+
+        public static void SecureDeleteFile(string path)
+        {
+            if (!File.Exists(path)) return;
+
+            try
+            {
+                // 属性解除（圧縮/暗号化/読み取り専用等）
+                try { File.SetAttributes(path, FileAttributes.Normal); } catch { }
+
+                // ADS（Alternate Data Streams）も可能な範囲で処理
+                foreach (var streamName in NtfsAlternateStreams.List(path))
+                {
+                    try { OverwriteStream(path, streamName); } catch { /* 続行 */ }
+                }
+
+                // 本体データを上書き（ランダム→ゼロ）
+                OverwriteFile(path);
+
+                // タイムスタンプを更新（痕跡の均質化）
+                try
+                {
+                    var now = DateTime.Now;
+                    File.SetCreationTime(path, now);
+                    File.SetLastWriteTime(path, now);
+                    File.SetLastAccessTime(path, now);
+                }
+                catch { }
+
+                // ランダム名へ改名（ファイル名痕跡を薄める）
+                try
+                {
+                    var dir = Path.GetDirectoryName(path)!;
+                    var rnd = RandomName() + Path.GetExtension(path);
+                    var newPath = Path.Combine(dir, rnd);
+                    try { File.Move(path, newPath); path = newPath; } catch { /* 失敗時はそのまま */ }
+                }
+                catch { }
+
+                // サイズを0に縮小 → 削除
+                try
+                {
+                    using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None))
+                    {
+                        fs.SetLength(0);
+                        fs.Flush(true);
+                    }
+                }
+                catch { /* 続行 */ }
+
+                try { File.Delete(path); } catch { /* 続行 */ }
+            }
+            catch
+            {
+                // 最後の手段：例外は握りつつ試行を続ける
+                try { File.Delete(path); } catch { }
+            }
+        }
+
+        private static void OverwriteFile(string path)
+        {
+            long len = 0;
+            try { len = new FileInfo(path).Length; } catch { }
+
+            if (len <= 0)
+            {
+                // 空ファイルでも名前痕跡対策として開いてFlush
+                using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None))
+                    fs.Flush(true);
+                return;
+            }
+
+            byte[] buf = new byte[BufferSize];
+
+            // 1パス目：ランダム
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None))
+            {
+                long remain = len;
+                while (remain > 0)
+                {
+                    Rng.GetBytes(buf);
+                    int write = (int)Math.Min(remain, buf.Length);
+                    fs.Write(buf, 0, write);
+                    remain -= write;
+                }
+                fs.Flush(true);
+            }
+
+            // 2パス目：ゼロ
+            Array.Clear(buf, 0, buf.Length);
+            using (var fs = new FileStream(path, FileMode.Open, FileAccess.Write, FileShare.None))
+            {
+                long remain = len;
+                while (remain > 0)
+                {
+                    int write = (int)Math.Min(remain, buf.Length);
+                    fs.Write(buf, 0, write);
+                    remain -= write;
+                }
+                fs.Flush(true);
+            }
+        }
+
+        private static void OverwriteStream(string basePath, string streamName)
+        {
+            var streamPath = basePath + ":" + streamName;
+            if (!File.Exists(streamPath)) return;
+
+            // シンプルにゼロ上書き1回（サイズが小さいことが多いため）
+            long len = 0;
+            try { len = new FileInfo(streamPath).Length; } catch { }
+            if (len <= 0) return;
+
+            byte[] buf = new byte[BufferSize];
+            Array.Clear(buf, 0, buf.Length);
+
+            using (var fs = new FileStream(streamPath, FileMode.Open, FileAccess.Write, FileShare.None))
+            {
+                long remain = len;
+                while (remain > 0)
+                {
+                    int write = (int)Math.Min(remain, buf.Length);
+                    fs.Write(buf, 0, write);
+                    remain -= write;
+                }
+                fs.Flush(true);
+            }
+        }
+
+        public static string RandomName()
+        {
+            // 16文字の英数
+            const string chars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            Span<byte> rnd = stackalloc byte[16];
+            Rng.GetBytes(rnd);
+            var sb = new StringBuilder(16);
+            foreach (var b in rnd) sb.Append(chars[b % chars.Length]);
+            return sb.ToString();
+        }
+    }
+
+    // ===== NTFS Alternate Data Streams 列挙（FindFirstStreamW/FindNextStreamW） =====
+    internal static class NtfsAlternateStreams
+    {
+        public static IEnumerable<string> List(string path)
+        {
+            var list = new List<string>();
+            IntPtr hFind = FindFirstStreamW(path, StreamInfoLevels.FindStreamInfoStandard, out WIN32_FIND_STREAM_DATA data, 0);
+            if (hFind == INVALID_HANDLE_VALUE) yield break;
+
+            try
+            {
+                do
+                {
+                    var name = data.cStreamName;
+                    // フォーマット：":NAME:$DATA" の形。$DATAのみを対象に。
+                    if (name.StartsWith(":") && name.EndsWith(":$DATA"))
+                    {
+                        var core = name.Substring(1, name.Length - 1 - ":$DATA".Length);
+                        if (!string.IsNullOrEmpty(core))
+                            yield return core;
+                    }
+                }
+                while (FindNextStreamW(hFind, out data));
+            }
+            finally
+            {
+                FindClose(hFind);
+            }
+        }
+
+        // P/Invoke
+        private const int MAX_PATH = 260;
+        private static readonly IntPtr INVALID_HANDLE_VALUE = new IntPtr(-1);
+
+        private enum StreamInfoLevels
+        {
+            FindStreamInfoStandard = 0
+        }
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct WIN32_FIND_STREAM_DATA
+        {
+            public long StreamSize;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = MAX_PATH + 36)]
+            public string cStreamName;
+        }
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern IntPtr FindFirstStreamW(
+            string lpFileName,
+            StreamInfoLevels InfoLevel,
+            out WIN32_FIND_STREAM_DATA lpFindStreamData,
+            uint dwFlags);
+
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool FindNextStreamW(
+            IntPtr hFindStream,
+            out WIN32_FIND_STREAM_DATA lpFindStreamData);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool FindClose(IntPtr hFindFile);
     }
 
     internal static class ShortcutHelper
@@ -359,7 +635,7 @@ namespace TrushBin
             link.SetArguments(args);
             link.SetWorkingDirectory(Path.GetDirectoryName(targetExe));
             link.SetIconLocation(File.Exists(iconPath) ? iconPath : targetExe, 0);
-            link.SetDescription("ドラッグ＆ドロップで C:\\trush へ移動 / 実行で操作メニュー");
+            link.SetDescription("ドラッグ＆ドロップで C:\\trushbin へ移動 / 実行で操作メニュー");
 
             IPersistFile file = (IPersistFile)link;
             file.Save(lnkPath, true);
