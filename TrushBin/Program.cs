@@ -5,7 +5,10 @@ using System.Linq;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
 using System.Windows.Forms;
+using static System.Net.WebRequestMethods;
 
 namespace TrushBin
 {
@@ -36,7 +39,7 @@ namespace TrushBin
                     return;
                 }
 
-                // 空にする（安全消去）
+                // 空にする（安全消去：プログレス付き）
                 if (args.Any(a => a.Equals("--empty", StringComparison.OrdinalIgnoreCase)))
                 {
                     var totalNow = TrushLogic.CountEntries(TrushLogic.TrushPath);
@@ -47,8 +50,8 @@ namespace TrushBin
                     if (confirm == DialogResult.OK)
                     {
                         int f, d;
-                        int total = TrushLogic.EmptyTrushSecure(out f, out d);
-                        MessageBox.Show($"完全消去しました。{total} 件（ファイル {f} / フォルダ {d}）", "TrushBin");
+                        TrushLogic.EmptyTrushSecureWithProgress(out f, out d);   // ← 進捗表示版
+                        MessageBox.Show($"完全消去しました。ファイル {f} / フォルダ {d}", "TrushBin");
                     }
 
                     TrushLogic.UpdateAllShortcutIcons();
@@ -73,14 +76,14 @@ namespace TrushBin
 
                 if (result == DialogResult.Yes)
                 {
-                    var confirm = MessageBox.Show(
+                    var confirm2 = MessageBox.Show(
                         $"ゴミ箱を完全消去（復旧困難化）します。よろしいですか？\n現在 {count} 件",
                         "TrushBin", MessageBoxButtons.OKCancel, MessageBoxIcon.Warning);
-                    if (confirm == DialogResult.OK)
+                    if (confirm2 == DialogResult.OK)
                     {
                         int f, d;
-                        int total = TrushLogic.EmptyTrushSecure(out f, out d);
-                        MessageBox.Show($"完全消去しました。{total} 件（ファイル {f} / フォルダ {d}）", "TrushBin");
+                        TrushLogic.EmptyTrushSecureWithProgress(out f, out d);   // ← 進捗表示版
+                        MessageBox.Show($"完全消去しました。ファイル {f} / フォルダ {d}", "TrushBin");
                     }
                     TrushLogic.UpdateAllShortcutIcons();
                     return;
@@ -98,9 +101,47 @@ namespace TrushBin
         }
     }
 
+    //================ 進捗ダイアログ ===================
+    internal class ProgressForm : Form
+    {
+        private ProgressBar bar;
+        private Label lblTitle;
+        private Label lblDetail;
+
+        public ProgressForm()
+        {
+            Text = "完全消去中…";
+            StartPosition = FormStartPosition.CenterScreen;
+            FormBorderStyle = FormBorderStyle.FixedDialog;
+            MaximizeBox = MinimizeBox = false;
+            ShowInTaskbar = true;
+            Width = 520;
+            Height = 160;
+
+            lblTitle = new Label { Left = 14, Top = 12, Width = 480, Text = "準備中…" };
+            bar = new ProgressBar { Left = 14, Top = 40, Width = 480, Height = 22, Style = ProgressBarStyle.Continuous, Minimum = 0, Maximum = 100 };
+            lblDetail = new Label { Left = 14, Top = 70, Width = 480, Height = 40, Text = "" };
+
+            Controls.Add(lblTitle);
+            Controls.Add(bar);
+            Controls.Add(lblDetail);
+        }
+
+        public void SetProgress(int percent, string title, string detail)
+        {
+            if (InvokeRequired)
+            {
+                BeginInvoke(new Action(() => SetProgress(percent, title, detail)));
+                return;
+            }
+            bar.Value = Math.Max(0, Math.Min(100, percent));
+            lblTitle.Text = title ?? "";
+            lblDetail.Text = detail ?? "";
+        }
+    }
+
     internal static class TrushLogic
     {
-        // 保存先（変更済み）
         public static readonly string TrushPath = @"C:\trushbin";
 
         public static void EnsureTrushDir()
@@ -122,11 +163,11 @@ namespace TrushBin
 
                 try
                 {
-                    if (File.Exists(p))
+                    if (System.IO.File.Exists(p))
                     {
                         var dest = UniqueDestination(Path.Combine(TrushPath, Path.GetFileName(p)));
                         MoveFileSafeWithSourceWipe(p, dest);
-                        if (!File.Exists(p)) moved++; else failures.Add(p);
+                        if (!System.IO.File.Exists(p)) moved++; else failures.Add(p);
                     }
                     else if (Directory.Exists(p))
                     {
@@ -142,79 +183,124 @@ namespace TrushBin
             {
                 MessageBox.Show(
                     "移動できなかった項目（使用中/権限/特殊パスの可能性）:\n" +
-                    string.Join("\n", failures.Take(10)) +
-                    (failures.Count > 10 ? $"\n…ほか {failures.Count - 10} 件" : ""),
+                string.Join("\n", failures.Take(10)) +
+                        (failures.Count > 10 ? $"\n…ほか {failures.Count - 10} 件" : ""),
                     "TrushBin", MessageBoxButtons.OK, MessageBoxIcon.Warning);
             }
 
             return moved;
         }
 
-        // 完全消去（成功したものだけカウントし、失敗は一覧表示）
-        public static int EmptyTrushSecure(out int filesDeleted, out int dirsDeleted)
+        // Fix for CS1628: Refactor the code to avoid using 'ref', 'out', or 'in' parameters inside the lambda expression.
+        // Instead, use local variables to accumulate the results and assign them back to the 'out' parameters after the lambda execution.
+
+        public static void EmptyTrushSecureWithProgress(out int filesDeleted, out int dirsDeleted)
         {
             filesDeleted = 0;
             dirsDeleted = 0;
-            var fails = new List<string>();
 
-            if (!Directory.Exists(TrushPath)) return 0;
+            if (!Directory.Exists(TrushPath)) return;
 
-            // 1) ファイル安全消去
-            foreach (var f in EnumerateFilesNoReparse(TrushPath))
+            var files = EnumerateFilesNoReparse(TrushPath).ToList();
+            var dirsDeep = EnumerateDirectoriesNoReparse(TrushPath).OrderByDescending(d => d.Length).ToList();
+
+            long totalBytes = 0;
+            foreach (var f in files)
             {
-                try
-                {
-                    if (SecureWipe.SecureDeleteFile(f)) filesDeleted++;
-                    else fails.Add(f);
-                }
-                catch { fails.Add(f); }
+                try { totalBytes += Math.Max(0, new FileInfo(f).Length) * 2; } catch { }
             }
 
-            // 2) ディレクトリ（深い順）リネーム→削除
-            var allDirsDeepFirst = EnumerateDirectoriesNoReparse(TrushPath)
-                .OrderByDescending(d => d.Length)
-                .ToList();
-
-            foreach (var d in allDirsDeepFirst)
+            using (var pf = new ProgressForm())
             {
-                try
+                pf.Show();
+                pf.SetProgress(0, "準備中…", $"対象ファイル {files.Count} / フォルダ {dirsDeep.Count}");
+
+                long processedBytes = 0;
+                var fails = new List<string>();
+
+                int localFilesDeleted = 0; // Local variable to accumulate file deletion count
+                int localDirsDeleted = 0; // Local variable to accumulate directory deletion count
+
+                var t = Task.Run(() =>
                 {
-                    var parent = Path.GetDirectoryName(d)!;
-                    var renamed = d;
-                    try
+                    foreach (var f in files)
                     {
-                        var rnd = SecureWipe.RandomName();
-                        renamed = Path.Combine(parent, rnd);
-                        Directory.Move(d, renamed);
+                        string name = f;
+                        try
+                        {
+                            bool ok = SecureWipe.SecureDeleteFileWithProgress(
+                                f,
+                                delta =>
+                                {
+                                    Interlocked.Add(ref processedBytes, delta);
+                                    int percent = totalBytes > 0 ? (int)(processedBytes * 100 / totalBytes) : 0;
+                                    pf.SetProgress(percent, "完全消去中…", Shorten(name, 70));
+                                });
+
+                            if (ok) Interlocked.Increment(ref localFilesDeleted); // Use local variable
+                            else lock (fails) fails.Add(f);
+                        }
+                        catch { lock (fails) fails.Add(f); }
                     }
-                    catch { /* rename失敗はスルー */ }
 
-                    try { Directory.Delete(renamed, false); } catch { }
-                    if (!Directory.Exists(renamed)) dirsDeleted++; else fails.Add(d);
+                    foreach (var d in dirsDeep)
+                    {
+                        try
+                        {
+                            var parent = Path.GetDirectoryName(d)!;
+                            var renamed = d;
+                            try
+                            {
+                                var rnd = SecureWipe.RandomName();
+                                renamed = Path.Combine(parent, rnd);
+                                Directory.Move(d, renamed);
+                            }
+                            catch { }
+
+                            try { Directory.Delete(renamed, false); } catch { }
+                            if (!Directory.Exists(renamed)) Interlocked.Increment(ref localDirsDeleted); // Use local variable
+                            else lock (fails) fails.Add(d);
+
+                            if (totalBytes == 0)
+                            {
+                                int percent = (int)(100.0 * (dirsDeep.IndexOf(d) + 1) / Math.Max(1, dirsDeep.Count));
+                                pf.SetProgress(Math.Min(99, percent), "フォルダ整理中…", Shorten(d, 70));
+                            }
+                        }
+                        catch { lock (fails) fails.Add(d); }
+                    }
+                });
+
+                while (!t.IsCompleted)
+                {
+                    Application.DoEvents();
+                    Thread.Sleep(30);
                 }
-                catch { fails.Add(d); }
+
+                try { ShellRefresh(TrushPath); } catch { }
+
+                pf.SetProgress(100, "最終処理中…", "");
+                Application.DoEvents();
+                Thread.Sleep(80);
+
+                if (localFilesDeleted + localDirsDeleted == 0 && (files.Count + dirsDeep.Count) > 0)
+                {
+                    MessageBox.Show("消去に失敗した可能性があります。権限/占有/特殊パスを確認してください。", "TrushBin",
+                        MessageBoxButtons.OK, MessageBoxIcon.Warning);
+                }
+
+                // Assign the accumulated results back to the 'out' parameters
+                filesDeleted = localFilesDeleted;
+                dirsDeleted = localDirsDeleted;
             }
+        }
 
-            // 3) 直下の空フォルダ掃除
-            foreach (var d in Directory.EnumerateDirectories(TrushPath, "*", SearchOption.TopDirectoryOnly))
-            {
-                try { Directory.Delete(d, false); } catch { }
-                if (!Directory.Exists(d)) dirsDeleted++; else fails.Add(d);
-            }
-
-            // Explorerに更新通知（見え方のズレを軽減）
-            try { ShellRefresh(TrushPath); } catch { }
-
-            if (fails.Count > 0)
-            {
-                MessageBox.Show(
-                    "一部の項目は消去できませんでした（使用中/権限/特殊パスの可能性）:\n" +
-                    string.Join("\n", fails.Take(10)) +
-                    (fails.Count > 10 ? $"\n…ほか {fails.Count - 10} 件" : ""),
-                    "TrushBin", MessageBoxButtons.OK, MessageBoxIcon.Warning);
-            }
-
-            return filesDeleted + dirsDeleted;
+        // ％表示で使う：ファイル名の省略
+        private static string Shorten(string s, int max)
+        {
+            if (string.IsNullOrEmpty(s) || s.Length <= max) return s;
+            int keep = (max - 3) / 2;
+            return s.Substring(0, keep) + "..." + s.Substring(s.Length - keep);
         }
 
         public static int CountEntries(string dir)
@@ -237,7 +323,7 @@ namespace TrushBin
                 string fullIco = Path.Combine(Path.GetDirectoryName(exePath)!, "full.ico");
 
                 var mainLnk = Path.Combine(desktop, "ゴミ箱（Trush）.lnk");
-                if (File.Exists(mainLnk))
+                if (System.IO.File.Exists(mainLnk))
                     ShortcutHelper.SetShortcutIcon(mainLnk, hasItems ? fullIco : emptyIco);
             }
             catch { /* 致命ではないので無視 */ }
@@ -260,17 +346,17 @@ namespace TrushBin
             {
                 if (!IsCrossVolume(src, dst))
                 {
-                    File.Move(src, dst); // 同一ボリュームは原子的移動
+                    System.IO.File.Move(src, dst); // 同一ボリュームは原子的移動
                 }
                 else
                 {
-                    File.Copy(src, dst, overwrite: false);
+                    System.IO.File.Copy(src, dst, overwrite: false);
                     SecureWipe.SecureDeleteFile(src); // 元側を安全消去
                 }
             }
             catch (IOException)
             {
-                File.Copy(src, dst, overwrite: false);
+                System.IO.File.Copy(src, dst, overwrite: false);
                 SecureWipe.SecureDeleteFile(src);
             }
         }
@@ -281,7 +367,7 @@ namespace TrushBin
             foreach (var f in Directory.GetFiles(sourceDir))
             {
                 var df = Path.Combine(destDir, Path.GetFileName(f));
-                File.Copy(f, df, overwrite: false);
+                System.IO.File.Copy(f, df, overwrite: false);
             }
             foreach (var d in Directory.GetDirectories(sourceDir))
             {
@@ -312,7 +398,7 @@ namespace TrushBin
 
         private static string UniqueDestination(string destPath)
         {
-            if (!File.Exists(destPath) && !Directory.Exists(destPath)) return destPath;
+            if (!System.IO.File.Exists(destPath) && !Directory.Exists(destPath)) return destPath;
 
             string dir = Path.GetDirectoryName(destPath)!;
             string baseName = Path.GetFileNameWithoutExtension(destPath);
@@ -321,14 +407,13 @@ namespace TrushBin
             for (int i = 1; i < 10000; i++)
             {
                 string trial = Path.Combine(dir, $"{baseName} ({i}){ext}");
-                if (!File.Exists(trial) && !Directory.Exists(trial))
+                if (!System.IO.File.Exists(trial) && !Directory.Exists(trial))
                     return trial;
             }
             string stamp = DateTime.Now.ToString("yyyyMMdd_HHmmssfff");
             return Path.Combine(dir, $"{baseName}_{stamp}{ext}");
         }
 
-        // 修正箇所: EnumerateFilesNoReparse メソッド
         private static IEnumerable<string> EnumerateFilesNoReparse(string root)
         {
             foreach (var f in Directory.EnumerateFiles(root, "*", SearchOption.AllDirectories))
@@ -336,19 +421,12 @@ namespace TrushBin
                 bool isReparsePoint = false;
                 try
                 {
-                    var attr = File.GetAttributes(f);
+                    var attr = System.IO.File.GetAttributes(f);
                     isReparsePoint = (attr & FileAttributes.ReparsePoint) != 0;
                 }
-                catch
-                {
-                    // Skip files that cause exceptions
-                    continue;
-                }
+                catch { continue; }
 
-                if (!isReparsePoint)
-                {
-                    yield return f;
-                }
+                if (!isReparsePoint) yield return f;
             }
         }
 
@@ -359,19 +437,12 @@ namespace TrushBin
                 bool isReparsePoint = false;
                 try
                 {
-                    var attr = File.GetAttributes(d);
+                    var attr = System.IO.File.GetAttributes(d);
                     isReparsePoint = (attr & FileAttributes.ReparsePoint) != 0;
                 }
-                catch
-                {
-                    // Skip directories that cause exceptions
-                    continue;
-                }
+                catch { continue; }
 
-                if (!isReparsePoint)
-                {
-                    yield return d;
-                }
+                if (!isReparsePoint) yield return d;
             }
         }
 
@@ -431,32 +502,38 @@ namespace TrushBin
             try { Directory.Delete(dir, false); } catch { /* 続行 */ }
         }
 
-        // 成功/失敗を返す（巨大ファイル等での“消えた判定”を厳密に）
+        // 進捗なしの簡易版（他の箇所からの再利用用）
         public static bool SecureDeleteFile(string path)
         {
-            if (!File.Exists(path)) return true;
+            return SecureDeleteFileWithProgress(path, _ => { });
+        }
+
+        // ==== 進捗付き：成功/失敗を返す ====
+        public static bool SecureDeleteFileWithProgress(string path, Action<long> progressBytesDelta)
+        {
+            if (!System.IO.File.Exists(path)) return true;
 
             try
             {
                 // 属性解除
-                try { File.SetAttributes(path, FileAttributes.Normal); } catch { }
+                try { System.IO.File.SetAttributes(path, FileAttributes.Normal); } catch { }
 
                 // ADSも処理（可能な範囲）
                 foreach (var streamName in NtfsAlternateStreams.List(path))
                 {
-                    try { OverwriteStream(path, streamName); } catch { /* 続行 */ }
+                    try { OverwriteStream(path, streamName, progressBytesDelta); } catch { /* 続行 */ }
                 }
 
-                // 本体データ上書き（ランダム→ゼロ）
-                OverwriteFile(path);
+                // 本体データ上書き（ランダム→ゼロ）※進捗コールバック
+                OverwriteFileWithProgress(path, progressBytesDelta);
 
                 // タイムスタンプを現在時刻で上書き
                 try
                 {
                     var now = DateTime.Now;
-                    File.SetCreationTime(path, now);
-                    File.SetLastWriteTime(path, now);
-                    File.SetLastAccessTime(path, now);
+                    System.IO.File.SetCreationTime(path, now);
+                    System.IO.File.SetLastWriteTime(path, now);
+                    System.IO.File.SetLastAccessTime(path, now);
                 }
                 catch { }
 
@@ -466,7 +543,7 @@ namespace TrushBin
                     var dir = Path.GetDirectoryName(path)!;
                     var rnd = RandomName() + Path.GetExtension(path);
                     var newPath = Path.Combine(dir, rnd);
-                    File.Move(path, newPath);
+                    System.IO.File.Move(path, newPath);
                     path = newPath;
                 }
                 catch { /* 改名失敗はそのまま */ }
@@ -482,17 +559,17 @@ namespace TrushBin
                 }
                 catch { /* 続行 */ }
 
-                try { File.Delete(path); } catch { }
-                return !File.Exists(path);
+                try { System.IO.File.Delete(path); } catch { }
+                return !System.IO.File.Exists(path);
             }
             catch
             {
-                try { File.Delete(path); } catch { }
-                return !File.Exists(path);
+                try { System.IO.File.Delete(path); } catch { }
+                return !System.IO.File.Exists(path);
             }
         }
 
-        private static void OverwriteFile(string path)
+        private static void OverwriteFileWithProgress(string path, Action<long> progressBytesDelta)
         {
             long len = 0;
             try { len = new FileInfo(path).Length; } catch { }
@@ -516,6 +593,7 @@ namespace TrushBin
                     int write = (int)Math.Min(remain, buf.Length);
                     fs.Write(buf, 0, write);
                     remain -= write;
+                    progressBytesDelta(write);
                 }
                 fs.Flush(true);
             }
@@ -530,15 +608,16 @@ namespace TrushBin
                     int write = (int)Math.Min(remain, buf.Length);
                     fs.Write(buf, 0, write);
                     remain -= write;
+                    progressBytesDelta(write);
                 }
                 fs.Flush(true);
             }
         }
 
-        private static void OverwriteStream(string basePath, string streamName)
+        private static void OverwriteStream(string basePath, string streamName, Action<long> progressBytesDelta)
         {
             var streamPath = basePath + ":" + streamName;
-            if (!File.Exists(streamPath)) return;
+            if (!System.IO.File.Exists(streamPath)) return;
 
             long len = 0;
             try { len = new FileInfo(streamPath).Length; } catch { }
@@ -555,6 +634,7 @@ namespace TrushBin
                     int write = (int)Math.Min(remain, buf.Length);
                     fs.Write(buf, 0, write);
                     remain -= write;
+                    progressBytesDelta(write);
                 }
                 fs.Flush(true);
             }
@@ -652,7 +732,7 @@ namespace TrushBin
 
         public static void SetShortcutIcon(string lnkPath, string iconPath)
         {
-            if (!File.Exists(lnkPath) || !File.Exists(iconPath)) return;
+            if (!System.IO.File.Exists(lnkPath) || !System.IO.File.Exists(iconPath)) return;
 
             IShellLinkW link = (IShellLinkW)new ShellLink();
             ((IPersistFile)link).Load(lnkPath, 0);
@@ -666,7 +746,7 @@ namespace TrushBin
             link.SetPath(targetExe);
             link.SetArguments(args);
             link.SetWorkingDirectory(Path.GetDirectoryName(targetExe));
-            link.SetIconLocation(File.Exists(iconPath) ? iconPath : targetExe, 0);
+            link.SetIconLocation(System.IO.File.Exists(iconPath) ? iconPath : targetExe, 0);
             link.SetDescription("ドラッグ＆ドロップで C:\\trushbin へ移動 / 実行で操作メニュー");
 
             IPersistFile file = (IPersistFile)link;
