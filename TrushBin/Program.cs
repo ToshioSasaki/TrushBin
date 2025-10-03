@@ -2,6 +2,10 @@ using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Text;
 
+/// <summary>
+/// 
+/// TrushBin: C:\trushbin ‚ÖˆÚ“® + ƒZƒLƒ…ƒAÁ‹
+/// </summary>
 namespace TrushBin
 {
     internal static class Program
